@@ -5,9 +5,8 @@ from lxml import html
 import threading
 from multiprocessing import Pool,Queue,Manager
 import urllib.request
-import MeituData
-
-lock = threading.Lock()
+import logging
+from logging.handlers import RotatingFileHandler
 
 def header(referer):
     headers = {
@@ -25,13 +24,22 @@ def header(referer):
     return headers
 
 
+def initlogger():
+    rotate = RotatingFileHandler('{}.log'.format(os.getpid()), 'w', 5 * 1024 * 1024, 5, delay=True)  # 最多备份5个日志文件,每个文件最大5M mode:w/a 写/追加
+    rotate.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s  %(levelname)s  %(thread)d  %(message)s')
+    rotate.setFormatter(formatter)
+    logging.getLogger('').addHandler(rotate)
+    logging.getLogger('').setLevel(logging.DEBUG)  # the loggerlevel is Warn in default, must reset it if want to print the info and debug level log
+
+
 def requestpage(url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_5) AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/59.0.3071.115 Safari/537.36'
     }
     req = urllib.request.Request(url=url, headers=headers)
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=5) as resp:
         return resp.read().decode('utf-8')
 
 
@@ -64,26 +72,37 @@ def getpages(queue, lock):
 
 def findimg(themepage):
     selector = html.fromstring(themepage)
-    return selector.xpath('//div[@class="main-image"]/p/a/img/@src')[0]
+    img = selector.xpath('//div[@class="main-image"]/p/a/img/@src')[0]
+    logging.debug('find img {}'.format(img))
+    return img
 
 
 def getimgs(themeurl):
+    logging.info('begin get img urls')
     result = []
-    themepage = requestpage(themeurl)
-    selector = html.fromstring(themepage)
-    result.append(findimg(themepage))
-    lastpagenum = selector.xpath('//div[@class="pagenavi"]/a[last()-1]/span')[0].text
-    for pagenum in range(1, int(lastpagenum)):
-        pageurl = '{}/{}'.format(themeurl, pagenum + 1)
-        page = requestpage(pageurl)
-        result.append(findimg(page))
+    try:
+        logging.debug('begin request page {}'.format(themeurl))
+        themepage = requestpage(themeurl)
+        logging.debug('begin analyze code')
+        selector = html.fromstring(themepage)
+        result.append(findimg(themepage))
+        lastpagenum = selector.xpath('//div[@class="pagenavi"]/a[last()-1]/span')[0].text
+        for pagenum in range(1, int(lastpagenum)):
+            pageurl = '{}/{}'.format(themeurl, pagenum + 1)
+            logging.debug('begin request page {}'.format(pageurl))
+            page = requestpage(pageurl)
+            logging.debug('finish request page')
+            result.append(findimg(page))
+    except:
+        pass
+    logging.info('finish get img urls from {}'.format(themeurl))
     return result
 
 
 def download(url, dir=''):
     filename = url.split('/')[-1]
     req = urllib.request.Request(url=url, headers=header(url))
-    with urllib.request.urlopen(req) as res:
+    with urllib.request.urlopen(req, timeout=5) as res:
         file = open(os.path.join(dir, filename), 'wb')
         file.write(res.read())
 
@@ -100,40 +119,50 @@ def runthread(pics = [], dir = ''):
     while True:
         picurl = ''
         try:
-            if lock.acquire():
-                if len(pics) > 0:
-                    picurl = pics.pop()
-        finally:
-            lock.release()
+                picurl = pics.pop()
+                logging.debug('pop pic {}'.format(picurl))
+        except:
+            pass
         if picurl:
-            print('pop pic {} in process {} thread {}'.format(picurl, os.getpid(), threading.current_thread()))
-            download(picurl, dir)
+            logging.debug('begin download {}'.format(picurl))
+            try:
+                download(picurl, dir)
+            except:
+                pass
+            logging.debug('complete download {}'.format(picurl))
         else:
+            logging.info('thread finish.')
             break
-    print('{} finish'.format(threading.current_thread()))
 
 
 def runprocess(queue, lock):
+    initlogger()
+    logging.info('process started.')
     while True:
         try:
+            logging.debug('begin to get record from queue.')
             record = queue.get(timeout=10)
+            logging.debug('finish get record {} from queue'.format(record))
             url, title = record
             title = re.sub(r'[\\/:\*\?"<>\|]', '_', title)
             dir = os.path.join('I:\\python\\crawler imgs', title)
             mkdir(dir)
             pics = getimgs(url)
             threads = []
-            for i in range(4):
-                thread = threading.Thread(target=runthread, args=(pics, dir))
-                print('create thread {} in process {}'.format(thread.name,os.getpid()))
-                thread.daemon = True
-                thread.start()
-                threads.append(thread)
-            for th in threads:
-                th.join()
+            while len(pics) > 0:
+                for th in threads:
+                    if not th.is_alive():
+                        threads.remove(th)
+                while len(threads) < 4:
+                    thread = threading.Thread(target=runthread, args=(pics, dir))
+                    thread.daemon = True
+                    thread.start()
+                    logging.debug('start thread {}'.format(thread.name))
+                    threads.append(thread)
+                time.sleep(10)
         except:
             break
-    print('process {} complete.'.format(os.getpid()))
+    logging.info('process complete.')
 
 
 def run():
