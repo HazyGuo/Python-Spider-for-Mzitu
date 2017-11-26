@@ -1,8 +1,9 @@
 import os
 import re
+import time
 from lxml import html
 import threading
-from multiprocessing import Pool
+from multiprocessing import Pool,Queue,Manager
 import urllib.request
 import MeituData
 
@@ -34,29 +35,31 @@ def requestpage(url):
         return resp.read().decode('utf-8')
 
 
-def getthemepages(summarypage):
-    pages = {}
-    data = MeituData.Meitu()
+def getthemepages(summarypage, queue, lock):
     selector = html.fromstring(summarypage)
     for node_a in selector.xpath('//ul[@id="pins"]/li/span/a'):
         url = node_a.get('href')
         title = node_a.text
-        pages[url] = title
-    data.pushrange(pages)
-    data.close()
+        try:
+            lock.acquire()
+            queue.put([url, title], False)
+        except:
+            pass
+        finally:
+            lock.release()
 
 
-def getpages():
+def getpages(queue, lock):
     pageurl = 'http://www.mzitu.com'
     page = requestpage(pageurl)
-    getthemepages(page)
+    getthemepages(page, queue, lock)
     selector = html.fromstring(page)
     lastpage = selector.xpath('//a[@class="page-numbers"][last()]/@href')[0]
     matchresult = re.match('http://www.mzitu.com/page/(\d+)/?', lastpage)
     summarypages = ['http://www.mzitu.com/page/{}/'.format(i + 1) for i in range(1, int(matchresult.group(1)))]
     for p in summarypages:
         sumpage = requestpage(p)
-        getthemepages(sumpage)
+        getthemepages(sumpage, queue, lock)
 
 
 def findimg(themepage):
@@ -96,57 +99,58 @@ def runthread(pics = [], dir = ''):
     global lock
     while True:
         picurl = ''
-        if lock.acquire():
-            if len(pics) > 0:
-                picurl = pics.pop()
+        try:
+            if lock.acquire():
+                if len(pics) > 0:
+                    picurl = pics.pop()
+        finally:
             lock.release()
-            if picurl:
-                print('pop pic {} in process {} thread {}'.format(picurl, os.getpid(), threading.current_thread()))
-                download(picurl, dir)
-            else:
-                break
+        if picurl:
+            print('pop pic {} in process {} thread {}'.format(picurl, os.getpid(), threading.current_thread()))
+            download(picurl, dir)
+        else:
+            break
     print('{} finish'.format(threading.current_thread()))
 
 
-def runprocess():
-    try:
-        data = MeituData.Meitu()
-        while True:
-            record = data.pop()
-            if record:
-                url, title = record
-                title = re.sub(r'[\\/:\*\?"<>\|]', '_', title)
-                dir = os.path.join('I:\\python\\crawler pics', title)
-                mkdir(dir)
-                pics = getimgs(url)
-                threads = []
-                for i in range(4):
-                    thread = threading.Thread(target=runthread, args=(pics, dir))
-                    print('create thread {} in process {}'.format(thread.name,os.getpid()))
-                    thread.daemon = True
-                    thread.start()
-                    threads.append(thread)
-                for th in threads:
-                    th.join()
-            else:
-                break
-    except IOError as ioe:
-        print(ioe)
-    except Exception as ex:
-        print(ex)
-    finally:
-        data.close()
+def runprocess(queue, lock):
+    while True:
+        try:
+            record = queue.get(timeout=10)
+            url, title = record
+            title = re.sub(r'[\\/:\*\?"<>\|]', '_', title)
+            dir = os.path.join('I:\\python\\crawler imgs', title)
+            mkdir(dir)
+            pics = getimgs(url)
+            threads = []
+            for i in range(4):
+                thread = threading.Thread(target=runthread, args=(pics, dir))
+                print('create thread {} in process {}'.format(thread.name,os.getpid()))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+            for th in threads:
+                th.join()
+        except:
+            break
+    print('process {} complete.'.format(os.getpid()))
 
 
 def run():
+    manager = Manager()
+    procqueue = manager.Queue(5000)
+    proclock = manager.Lock()
     process = Pool()
     num_cpus = os.cpu_count()
-    print('将会启动进程数为：', num_cpus)
-    for i in range(num_cpus):
-        process.apply_async(runprocess)
+    print('将会启动进程数为：', num_cpus + 1)
+    for i in range(num_cpus + 1):
+        if i == 0:
+            process.apply_async(getpages, args=(procqueue, proclock))
+            time.sleep(10)
+        else:
+            process.apply_async(runprocess, args=(procqueue, proclock))
     process.close()
     process.join()
 
 if __name__ == '__main__':
-    getpages()
     run()
